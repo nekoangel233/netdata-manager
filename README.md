@@ -29,10 +29,24 @@ curl -fsSL https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/n
 
 在末尾加上 `--ts-authkey tskey-auth-xxx`，就不用手动点链接登录 Tailscale 了。
 
+已经部署过的子节点再运行这条命令时，**不会重复安装**，只更新 API Key 和父节点地址，然后重启 Netdata。想完整重新配置的话，在末尾加 `--full`。
+
+## 更换 API Key
+
+在父节点上执行：
+
+```bash
+sudo netdata-manager rotate-key
+```
+
+旧 Key 立即作废，所有子节点会断开。把打印出来的新加入命令在每台子节点上运行一次即可重新连上（只会更新 Key，不会重装）。
+
 ## 日常管理
 
 ```bash
 sudo netdata-manager status      # 状态 / 已连接的节点
+sudo netdata-manager join-cmd    # 父节点：打印子节点加入命令
+sudo netdata-manager rotate-key  # 父节点：更换 API Key
 sudo netdata-manager logs        # 推送(streaming)相关日志
 sudo netdata-manager restart     # 重启 Netdata
 sudo netdata-manager update      # 更新本脚本
@@ -50,6 +64,7 @@ sudo netdata-manager uninstall   # 卸载 Netdata
 | `--ml on\|off` | 机器学习异常检测 | `off` |
 | `--interval N` | 子节点采集间隔（秒） | `2` |
 | `--ts-authkey KEY` | Tailscale 认证密钥 | 无 |
+| `--full` | 子节点已部署时也强制完整重新配置 | 只更新 Key |
 
 ## 注意
 

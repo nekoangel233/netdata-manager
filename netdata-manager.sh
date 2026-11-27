@@ -14,6 +14,7 @@
 #
 #    部署完成后，本脚本会安装为 netdata-manager 命令：
 #      sudo netdata-manager join-cmd    # 父节点：打印子节点加入命令
+#      sudo netdata-manager rotate-key  # 父节点：更换 API Key（旧 Key 立即作废）
 #      sudo netdata-manager status      # 查看状态 / 已连接的子节点
 #      sudo netdata-manager restart     # 重启 Netdata
 #      sudo netdata-manager logs        # 查看最近的推送(streaming)日志
@@ -28,6 +29,7 @@
 #    --ml on|off           是否开启机器学习异常检测，默认 off（省 CPU）
 #    --interval N          子节点采集间隔（秒），默认 2
 #    --ts-authkey KEY      Tailscale 认证密钥，填了就不用手动点链接登录
+#    --full                子节点已部署时也强制完整重装配置（默认只更新 Key 和父节点地址）
 #
 #  注意：脚本会用自己的配置覆盖 netdata.conf 和 stream.conf，
 #        覆盖前会自动备份为 *.bak.时间戳。
@@ -51,6 +53,7 @@ INTERVAL=2
 PARENT_IP=""
 API_KEY=""
 TS_AUTHKEY=""
+FULL=0
 
 # ---- 输出工具 ----------------------------------------------------------------
 c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_cyan=$'\033[36m'; c_off=$'\033[0m'
@@ -101,6 +104,7 @@ parse_opts() {
       --parent)       PARENT_IP="${2:?--parent 需要父节点 IP}"; shift ;;
       --key)          API_KEY="${2:?--key 需要 API Key}"; shift ;;
       --ts-authkey)   TS_AUTHKEY="${2:?--ts-authkey 需要密钥}"; shift ;;
+      --full)         FULL=1 ;;
       -h|--help)      usage ;;
       *) die "未知参数：$1（用 --help 查看用法）" ;;
     esac
@@ -291,6 +295,36 @@ print_join_cmd() {
   warn "API Key 相当于密码，不要公开发出去"
 }
 
+cmd_rotate_key() {
+  load_state
+  [ "${ROLE:-}" = parent ] || die "rotate-key 只能在父节点上运行"
+  [ -n "${API_KEY:-}" ] || die "找不到当前的 API Key（$STATE_FILE）"
+  detect_paths
+  local conf="$NETDATA_ETC/stream.conf"
+  grep -qF "[$API_KEY]" "$conf" || die "$conf 里找不到当前 Key 的配置段，请重新执行 parent 部署"
+
+  warn "更换后，所有子节点会立即断开，需要在每台子节点上重新运行新的加入命令"
+  local ans=""
+  if [ "${1:-}" = "--yes" ]; then
+    ans=y
+  else
+    read -r -p "确定要更换 API Key 吗？[y/N] " ans </dev/tty || true
+  fi
+  [ "$ans" = y ] || [ "$ans" = Y ] || { info "已取消"; exit 0; }
+
+  local old_key="$API_KEY"
+  API_KEY="$(cat /proc/sys/kernel/random/uuid)"
+  backup "$conf"
+  sed -i "s/^\[$old_key\]\$/[$API_KEY]/" "$conf"
+  grep -qF "[$API_KEY]" "$conf" || die "写入新 Key 失败，原配置已备份"
+
+  save_state parent
+  restart_netdata
+  log "API Key 已更换，旧 Key 已作废"
+  echo
+  print_join_cmd
+}
+
 # ---- 子节点 ------------------------------------------------------------------
 cmd_child() {
   parse_opts "$@"
@@ -300,10 +334,26 @@ cmd_child() {
     *x.x*|*'<'*|*'>'*|*你的*) die "--parent / --key 填的是示例占位符，请在父节点执行 sudo netdata-manager join-cmd 获取真实命令" ;;
   esac
 
+  # 已经是子节点：不重复安装，只更新 Key 和父节点地址
+  local prev_role=""
+  [ -f "$STATE_FILE" ] && prev_role="$(. "$STATE_FILE"; echo "${ROLE:-}")"
+  if [ "$FULL" -eq 0 ] && [ "$prev_role" = child ] && netdata_installed; then
+    detect_paths
+    if grep -q '^\[stream\]' "$NETDATA_ETC/stream.conf" 2>/dev/null; then
+      cmd_child_update_key
+      return
+    fi
+  fi
+
   install_netdata
   detect_paths
   [ "$USE_TAILSCALE" -eq 1 ] && setup_tailscale
 
+  check_parent_reachable
+  write_child_config
+}
+
+check_parent_reachable() {
   info "检查能否连上父节点 $PARENT_IP:19999 ..."
   if curl -fsS --max-time 8 "http://$PARENT_IP:19999/api/v1/info" >/dev/null 2>&1; then
     log "能连上父节点"
@@ -311,7 +361,9 @@ cmd_child() {
     warn "暂时连不上父节点。常见原因：Tailscale 未登录 / 父节点没监听这个 IP / --allow 不包含本机 IP"
     warn "配置会照常写入，连通后会自动开始推送"
   fi
+}
 
+write_child_config() {
   backup "$NETDATA_ETC/netdata.conf"
   cat > "$NETDATA_ETC/netdata.conf" <<EOF
 # 由 netdata-manager.sh 生成（角色：子节点）
@@ -350,6 +402,22 @@ EOF
   echo
   log "子节点部署完成！约 1 分钟内应该能在父节点面板的 Nodes 列表里看到 $(hostname)"
   info "如果没出现，执行：sudo $SELF logs"
+}
+
+# 子节点快速更新：只改 stream.conf 里的父节点地址和 API Key，其他一概不动
+cmd_child_update_key() {
+  log "检测到本机已经是子节点，跳过安装，只更新 API Key 和父节点地址"
+  check_parent_reachable
+  local conf="$NETDATA_ETC/stream.conf"
+  backup "$conf"
+  sed -i -E "s|^([[:space:]]*destination[[:space:]]*=).*|\1 $PARENT_IP:19999|; s|^([[:space:]]*api key[[:space:]]*=).*|\1 $API_KEY|" "$conf"
+  grep -qF "$API_KEY" "$conf" || die "写入新 Key 失败（$conf 格式不符合预期），可加 --full 重新完整配置"
+  save_state child
+  restart_netdata
+  install_self
+  echo
+  log "已更新！约 1 分钟内会重新连上父节点 $PARENT_IP"
+  info "如果没连上，执行：sudo $SELF logs"
 }
 
 # ---- 运维命令 ----------------------------------------------------------------
@@ -405,6 +473,7 @@ main() {
     parent)    need_root; cmd_parent "$@" ;;
     child)     need_root; cmd_child "$@" ;;
     join-cmd)  need_root; print_join_cmd ;;
+    rotate-key) need_root; cmd_rotate_key "$@" ;;
     status)    need_root; cmd_status ;;
     restart)   need_root; restart_netdata ;;
     logs)      need_root; cmd_logs ;;
