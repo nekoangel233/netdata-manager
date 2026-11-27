@@ -65,6 +65,22 @@ sudo netdata-manager set-ts-key
 
 Tailscale auth key 最长 90 天有效，过期后在 Tailscale 后台重新生成，再执行一次 `set-ts-key`。不想保存了就执行 `sudo netdata-manager clear-ts-key`。
 
+## 隐私：禁用 Netdata Cloud
+
+新部署的父节点和子节点会自动：
+
+- 删除登录 Netdata Cloud 时留下的凭据（`claim.conf`、`cloud.d/`）
+- 在 `cloud.d/cloud.conf` 里设置 `enabled = no`，以后误点 Sign in 也连不上
+- 不使用 Netdata 的公共 registry（`registry.my-netdata.io`）
+
+已经部署好的机器，在每台上执行一次：
+
+```bash
+sudo netdata-manager disable-cloud
+```
+
+Netdata Cloud 网站上之前的节点记录不会自动消失，需要登录 app.netdata.cloud 手动删除。
+
 ## 日常管理
 
 ```bash
@@ -73,6 +89,7 @@ sudo netdata-manager join-cmd    # 父节点：打印子节点加入命令
 sudo netdata-manager rotate-key  # 父节点：更换 API Key
 sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key
 sudo netdata-manager clear-ts-key # 父节点：删除保存的 Tailscale auth key
+sudo netdata-manager disable-cloud # 断开并禁用 Netdata Cloud
 sudo netdata-manager logs        # 推送(streaming)相关日志
 sudo netdata-manager restart     # 重启 Netdata
 sudo netdata-manager update      # 更新本脚本

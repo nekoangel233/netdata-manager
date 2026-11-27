@@ -18,6 +18,7 @@
 #      sudo netdata-manager rotate-key  # 父节点：更换 API Key（旧 Key 立即作废）
 #      sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key，加入命令自动带上
 #      sudo netdata-manager clear-ts-key # 父节点：删除已保存的 Tailscale auth key
+#      sudo netdata-manager disable-cloud # 断开并禁用 Netdata Cloud（新部署默认已执行）
 #      sudo netdata-manager status      # 查看状态 / 已连接的子节点
 #      sudo netdata-manager restart     # 重启 Netdata
 #      sudo netdata-manager logs        # 查看最近的推送(streaming)日志
@@ -290,6 +291,7 @@ EOF
   chmod 640 "$NETDATA_ETC/stream.conf"
   chgrp netdata "$NETDATA_ETC/stream.conf" 2>/dev/null || true
 
+  apply_no_cloud
   save_state parent
   restart_netdata
   install_self
@@ -348,6 +350,58 @@ cmd_rotate_key() {
   log "API Key 已更换，旧 Key 已作废"
   echo
   print_join_cmd
+}
+
+# ---- 隐私：断开并禁用 Netdata Cloud ------------------------------------------
+netdata_lib_dir() {
+  if [ -d /opt/netdata/var/lib/netdata ]; then echo /opt/netdata/var/lib/netdata; else echo /var/lib/netdata; fi
+}
+
+# 只写配置，不重启（由调用方负责重启）
+apply_no_cloud() {
+  local lib cloud_d
+  lib="$(netdata_lib_dir)"
+  cloud_d="$lib/cloud.d"
+
+  # 1. 删除登录 Cloud 时留下的凭据和认领信息
+  rm -f "$NETDATA_ETC/claim.conf"
+  if [ -d "$cloud_d" ]; then
+    find "$cloud_d" -mindepth 1 -delete
+  fi
+  mkdir -p "$cloud_d"
+
+  # 2. 禁止再连接 Cloud（以后误点 Sign in 也连不上）
+  cat > "$cloud_d/cloud.conf" <<'EOF'
+# 由 netdata-manager.sh 生成：禁用 Netdata Cloud 连接
+[global]
+    enabled = no
+EOF
+  chown -R netdata:netdata "$cloud_d" 2>/dev/null || true
+  chmod 750 "$cloud_d"; chmod 640 "$cloud_d/cloud.conf"
+
+  # 3. 不让浏览器把节点信息上报到 Netdata 的公共 registry
+  local conf="$NETDATA_ETC/netdata.conf"
+  if [ -f "$conf" ] && ! grep -q '^\[registry\]' "$conf"; then
+    cat >> "$conf" <<'EOF'
+
+[registry]
+    # 不使用 Netdata 的公共 registry（registry.my-netdata.io）
+    enabled = no
+    registry to announce = http://127.0.0.1:19999
+EOF
+  fi
+  log "已删除 Cloud 登录凭据，并禁用 Cloud 连接和公共 registry"
+}
+
+cmd_disable_cloud() {
+  netdata_installed || die "本机没有安装 Netdata"
+  detect_paths
+  apply_no_cloud
+  restart_netdata
+  if curl -fsS --max-time 5 http://127.0.0.1:19999/api/v1/info 2>/dev/null | grep -q '"cloud-enabled"[[:space:]]*:[[:space:]]*false'; then
+    log "已确认：本机 Netdata 报告 cloud-enabled = false"
+  fi
+  warn "Netdata Cloud 网站上仍保留着之前的节点记录：登录 app.netdata.cloud 把节点删掉，不再使用的话可以删除账号"
 }
 
 # ---- 子节点 ------------------------------------------------------------------
@@ -420,6 +474,7 @@ EOF
   chmod 640 "$NETDATA_ETC/stream.conf"
   chgrp netdata "$NETDATA_ETC/stream.conf" 2>/dev/null || true
 
+  apply_no_cloud
   save_state child
   restart_netdata
   install_self
@@ -617,6 +672,7 @@ menu() {
   8) 更新脚本
   9) 重新部署父节点
  10) 卸载 Netdata
+ 11) 断开并禁用 Netdata Cloud
   0) 退出
 EOF
         ask choice "请选择："
@@ -631,6 +687,7 @@ EOF
           8) menu_update_self ;;
           9) run_action menu_deploy_parent ;;
           10) run_action cmd_uninstall ;;
+          11) run_action cmd_disable_cloud ;;
           0|q) exit 0 ;;
           *) warn "无效选项" ;;
         esac ;;
@@ -642,6 +699,7 @@ EOF
   4) 重启 Netdata
   5) 更新脚本
   6) 卸载 Netdata
+  7) 断开并禁用 Netdata Cloud
   0) 退出
 EOF
         ask choice "请选择："
@@ -652,6 +710,7 @@ EOF
           4) run_action restart_netdata ;;
           5) menu_update_self ;;
           6) run_action cmd_uninstall ;;
+          7) run_action cmd_disable_cloud ;;
           0|q) exit 0 ;;
           *) warn "无效选项" ;;
         esac ;;
@@ -684,6 +743,7 @@ main() {
     rotate-key) need_root; cmd_rotate_key "$@" ;;
     set-ts-key) need_root; cmd_set_ts_key "$@" ;;
     clear-ts-key) need_root; cmd_clear_ts_key ;;
+    disable-cloud) need_root; cmd_disable_cloud ;;
     menu|"")   need_root; menu ;;
     status)    need_root; cmd_status ;;
     restart)   need_root; restart_netdata ;;
