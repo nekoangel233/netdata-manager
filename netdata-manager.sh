@@ -23,6 +23,7 @@
 #      sudo netdata-manager restart     # 重启 Netdata
 #      sudo netdata-manager logs        # 查看最近的推送(streaming)日志
 #      sudo netdata-manager update      # 更新本脚本到最新版
+#      sudo netdata-manager version     # 查看脚本版本
 #      sudo netdata-manager uninstall   # 卸载 Netdata
 #
 #  常用选项：
@@ -40,7 +41,9 @@
 # =============================================================================
 set -euo pipefail
 
+SCRIPT_VERSION="2026.11.27-6"
 STATE_FILE="/etc/netdata-manager.conf"
+REPO="nekoangel233/netdata-manager"
 SCRIPT_URL="https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/netdata-manager.sh"
 # 装到 /usr/bin：CentOS/RHEL 的 sudo 不会在 /usr/local/bin 里找命令
 INSTALL_PATH="/usr/bin/netdata-manager"
@@ -80,16 +83,27 @@ usage() {
 
 # 把本脚本安装为 netdata-manager 命令，方便以后执行 status / logs 等
 install_self() {
-  local tmp
+  local tmp url sha new_ver
   tmp="$(mktemp)"
-  if curl -fsSL "$SCRIPT_URL" -o "$tmp" && head -n1 "$tmp" | grep -q bash; then
+  # raw.githubusercontent.com 的 main 链接有约 5 分钟缓存，
+  # 先查最新提交的 sha，再按 sha 下载，保证拿到的是最新版
+  sha="$(curl -fsSL --max-time 8 "https://api.github.com/repos/$REPO/commits/main" 2>/dev/null \
+         | grep -m1 '"sha"' | sed -E 's/.*"sha"[[:space:]]*:[[:space:]]*"([0-9a-f]{40})".*/\1/' || true)"
+  if [[ "$sha" =~ ^[0-9a-f]{40}$ ]]; then
+    url="https://raw.githubusercontent.com/$REPO/$sha/netdata-manager.sh"
+  else
+    url="$SCRIPT_URL"
+  fi
+
+  if curl -fsSL "$url" -o "$tmp" && head -n1 "$tmp" | grep -q bash && bash -n "$tmp"; then
+    new_ver="$(grep -m1 '^SCRIPT_VERSION=' "$tmp" | cut -d'"' -f2 || true)"
     install -m 755 "$tmp" "$INSTALL_PATH"
-    log "已安装命令：$INSTALL_PATH（以后直接用 sudo netdata-manager status 等）"
+    log "已安装命令：$INSTALL_PATH（版本 ${new_ver:-未知}）"
   elif [ -f "$0" ] && [ "$(readlink -f "$0")" != "$INSTALL_PATH" ]; then
     install -m 755 "$0" "$INSTALL_PATH"
-    log "已安装命令：$INSTALL_PATH"
+    log "已安装命令：$INSTALL_PATH（版本 $SCRIPT_VERSION）"
   else
-    warn "没能安装 netdata-manager 命令（下载失败），不影响监控本身"
+    warn "没能下载最新版脚本，当前版本 $SCRIPT_VERSION 保持不变"
   fi
   rm -f "$tmp"
   rm -f "$LEGACY_PATH"   # 清理旧版本装在 /usr/local/bin 的副本
@@ -503,6 +517,7 @@ cmd_child_update_key() {
 # ---- 运维命令 ----------------------------------------------------------------
 cmd_status() {
   load_state
+  echo "脚本版本：$SCRIPT_VERSION"
   echo "角色：${ROLE:-未通过本脚本配置}"
   echo -n "Netdata 服务："; systemctl is-active netdata 2>/dev/null || true
   if command -v tailscale >/dev/null 2>&1; then
@@ -609,7 +624,7 @@ menu_header() {
   local role="$1" svc ts
   svc="$(systemctl is-active netdata 2>/dev/null || echo 未安装)"
   echo
-  echo "${c_cyan}========== Netdata 管理菜单 ==========${c_off}"
+  echo "${c_cyan}===== Netdata 管理菜单（版本 $SCRIPT_VERSION）=====${c_off}"
   case "$role" in
     parent) echo "角色：父节点    Netdata：$svc" ;;
     child)  echo "角色：子节点    Netdata：$svc    父节点：$(state_get PARENT_IP)" ;;
@@ -750,6 +765,7 @@ main() {
     logs)      need_root; cmd_logs ;;
     update)    need_root; install_self ;;
     uninstall) need_root; cmd_uninstall ;;
+    -v|--version|version) echo "$SCRIPT_VERSION" ;;
     -h|--help|help) usage ;;
     *) die "未知命令：$cmd（用 --help 查看用法）" ;;
   esac
