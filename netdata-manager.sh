@@ -36,7 +36,9 @@ set -euo pipefail
 
 STATE_FILE="/etc/netdata-manager.conf"
 SCRIPT_URL="https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/netdata-manager.sh"
-INSTALL_PATH="/usr/local/bin/netdata-manager"
+# 装到 /usr/bin：CentOS/RHEL 的 sudo 不会在 /usr/local/bin 里找命令
+INSTALL_PATH="/usr/bin/netdata-manager"
+LEGACY_PATH="/usr/local/bin/netdata-manager"
 SELF="netdata-manager"
 
 # ---- 默认参数 ----------------------------------------------------------------
@@ -83,6 +85,7 @@ install_self() {
     warn "没能安装 netdata-manager 命令（下载失败），不影响监控本身"
   fi
   rm -f "$tmp"
+  rm -f "$LEGACY_PATH"   # 清理旧版本装在 /usr/local/bin 的副本
 }
 
 # ---- 参数解析 ----------------------------------------------------------------
@@ -293,6 +296,9 @@ cmd_child() {
   parse_opts "$@"
   [ -n "$PARENT_IP" ] || die "缺少 --parent（父节点 IP）。可在父节点执行 join-cmd 获取完整命令"
   [ -n "$API_KEY" ]   || die "缺少 --key（API Key）。可在父节点执行 join-cmd 获取完整命令"
+  case "$PARENT_IP$API_KEY" in
+    *x.x*|*'<'*|*'>'*|*你的*) die "--parent / --key 填的是示例占位符，请在父节点执行 sudo netdata-manager join-cmd 获取真实命令" ;;
+  esac
 
   install_netdata
   detect_paths
@@ -386,7 +392,7 @@ cmd_uninstall() {
   tmp="$(mktemp -d)"
   curl -fsSL https://get.netdata.cloud/kickstart.sh -o "$tmp/kickstart.sh"
   sh "$tmp/kickstart.sh" --uninstall --non-interactive
-  rm -rf "$tmp" /etc/systemd/system/netdata.service.d/10-wait-tailscale.conf "$STATE_FILE" "$INSTALL_PATH"
+  rm -rf "$tmp" /etc/systemd/system/netdata.service.d/10-wait-tailscale.conf "$STATE_FILE" "$INSTALL_PATH" "$LEGACY_PATH"
   systemctl daemon-reload || true
   log "Netdata 已卸载（Tailscale 未动，如需卸载请用系统包管理器）"
 }
