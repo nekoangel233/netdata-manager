@@ -14,7 +14,7 @@
 #
 #    部署完成后，本脚本会安装为 netdata-manager 命令。
 #    直接运行 sudo netdata-manager（不带参数）会打开交互式菜单。也可以用子命令：
-#      sudo netdata-manager join-cmd    # 父节点：打印子节点加入命令
+#      sudo netdata-manager join-cmd [名字] # 父节点：打印子节点加入命令（可带上节点名）
 #      sudo netdata-manager rotate-key  # 父节点：更换 API Key（旧 Key 立即作废）
 #      sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key，加入命令自动带上
 #      sudo netdata-manager clear-ts-key # 父节点：删除已保存的 Tailscale auth key
@@ -36,13 +36,14 @@
 #    --interval N          子节点采集间隔（秒），默认 2
 #    --ts-authkey KEY      Tailscale 认证密钥，填了就不用手动点链接登录
 #    --full                子节点已部署时也强制完整重装配置（默认只更新 Key 和父节点地址）
+#    --name NAME           部署时直接设置节点在面板里显示的名称
 #
 #  注意：脚本会用自己的配置覆盖 netdata.conf 和 stream.conf，
 #        覆盖前会自动备份为 *.bak.时间戳。
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2026.11.27-7"
+SCRIPT_VERSION="2026.11.27-8"
 STATE_FILE="/etc/netdata-manager.conf"
 REPO="nekoangel233/netdata-manager"
 SCRIPT_URL="https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/netdata-manager.sh"
@@ -62,6 +63,7 @@ PARENT_IP=""
 API_KEY=""
 TS_AUTHKEY=""
 FULL=0
+NODE_NAME=""
 
 # ---- 输出工具 ----------------------------------------------------------------
 c_green=$'\033[32m'; c_yellow=$'\033[33m'; c_red=$'\033[31m'; c_cyan=$'\033[36m'; c_off=$'\033[0m'
@@ -125,6 +127,8 @@ parse_opts() {
       --ts-authkey)   TS_AUTHKEY="${2:?--ts-authkey 需要密钥}"; shift
                       valid_ts_key "$TS_AUTHKEY" || die "--ts-authkey 格式不对，应以 tskey- 开头" ;;
       --full)         FULL=1 ;;
+      --name)         NODE_NAME="${2:?--name 需要一个名字}"; shift
+                      valid_name "$NODE_NAME" || die "名称只能用字母、数字、点、下划线、横线，最长 63 个字符" ;;
       -h|--help)      usage ;;
       *) die "未知参数：$1（用 --help 查看用法）" ;;
     esac
@@ -278,7 +282,7 @@ cmd_parent() {
   fi
 
   local keep_name
-  keep_name="$(custom_name)"
+  keep_name="${NODE_NAME:-$(custom_name)}"
   backup "$NETDATA_ETC/netdata.conf"
   cat > "$NETDATA_ETC/netdata.conf" <<EOF
 # 由 netdata-manager.sh 生成（角色：父节点）
@@ -324,14 +328,20 @@ EOF
 }
 
 print_join_cmd() {
+  local name="${1:-}"
+  if [ -n "$name" ]; then
+    valid_name "$name" || die "名称只能用字母、数字、点、下划线、横线，最长 63 个字符"
+  fi
   load_state
   [ "${ROLE:-}" = parent ] || die "这台机器还不是父节点，请先部署父节点"
   echo "${c_cyan}在新服务器上执行这一条命令即可加入：${c_off}"
   echo
   local extra=""
   [ -n "${TS_AUTHKEY:-}" ] && extra=" --ts-authkey $TS_AUTHKEY"
+  [ -n "$name" ] && extra="$extra --name $name"
   echo "  curl -fsSL $SCRIPT_URL | sudo bash -s -- child --parent $BIND_IP --key $API_KEY$extra"
   echo
+  [ -n "$name" ] || info "想直接设置节点名称：sudo $SELF join-cmd 名字（已加入的节点重新运行也会改名，不会重装）"
   if [ -n "${TS_AUTHKEY:-}" ]; then
     info "已自动带上保存的 Tailscale auth key，新服务器不用再手动登录 Tailscale"
   else
@@ -431,6 +441,19 @@ custom_name() {
     | sed -E 's/^[[:space:]]*hostname[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' || true
 }
 
+valid_name() { [[ "$1" =~ ^[A-Za-z0-9._-]{1,63}$ ]]; }
+
+# 把节点名写进 netdata.conf 的 [global]（不重启）
+set_name_in_conf() {
+  local name="$1" conf="$NETDATA_ETC/netdata.conf"
+  sed -i -E '/^[[:space:]]*hostname[[:space:]]*=/d' "$conf"
+  if grep -q '^\[global\]' "$conf"; then
+    sed -i "0,/^\[global\]/s//[global]\n    hostname = $name/" "$conf"
+  else
+    { global_section "$name"; cat "$conf"; } > "$conf.tmp" && cat "$conf.tmp" > "$conf" && rm -f "$conf.tmp"
+  fi
+}
+
 # 生成配置时带上自定义节点名，避免重新部署后名字被冲掉
 global_section() {
   local name="$1"
@@ -448,15 +471,10 @@ cmd_rename() {
     read -r -p "新的节点名称（字母、数字、. _ -；直接回车取消）：" name </dev/tty || true
   fi
   [ -n "$name" ] || { info "已取消"; return 0; }
-  [[ "$name" =~ ^[A-Za-z0-9._-]{1,63}$ ]] || die "名称只能用字母、数字、点、下划线、横线，最长 63 个字符"
+  valid_name "$name" || die "名称只能用字母、数字、点、下划线、横线，最长 63 个字符"
 
   backup "$conf"
-  sed -i -E '/^[[:space:]]*hostname[[:space:]]*=/d' "$conf"
-  if grep -q '^\[global\]' "$conf"; then
-    sed -i "0,/^\[global\]/s//[global]\n    hostname = $name/" "$conf"
-  else
-    { global_section "$name"; cat "$conf"; } > "$conf.tmp" && cat "$conf.tmp" > "$conf" && rm -f "$conf.tmp"
-  fi
+  set_name_in_conf "$name"
   restart_netdata
   log "节点名称已改为：$name"
   if [ "$(state_get ROLE)" = child ]; then
@@ -504,7 +522,7 @@ check_parent_reachable() {
 
 write_child_config() {
   local keep_name
-  keep_name="$(custom_name)"
+  keep_name="${NODE_NAME:-$(custom_name)}"
   backup "$NETDATA_ETC/netdata.conf"
   cat > "$NETDATA_ETC/netdata.conf" <<EOF
 # 由 netdata-manager.sh 生成（角色：子节点）
@@ -549,12 +567,17 @@ EOF
 
 # 子节点快速更新：只改 stream.conf 里的父节点地址和 API Key，其他一概不动
 cmd_child_update_key() {
-  log "检测到本机已经是子节点，跳过安装，只更新 API Key 和父节点地址"
+  log "检测到本机已经是子节点，跳过安装，只更新 API Key、父节点地址${NODE_NAME:+和节点名称}"
   check_parent_reachable
   local conf="$NETDATA_ETC/stream.conf"
   backup "$conf"
   sed -i -E "s|^([[:space:]]*destination[[:space:]]*=).*|\1 $PARENT_IP:19999|; s|^([[:space:]]*api key[[:space:]]*=).*|\1 $API_KEY|" "$conf"
   grep -qF "$API_KEY" "$conf" || die "写入新 Key 失败（$conf 格式不符合预期），可加 --full 重新完整配置"
+  if [ -n "$NODE_NAME" ]; then
+    backup "$NETDATA_ETC/netdata.conf"
+    set_name_in_conf "$NODE_NAME"
+    log "节点名称设为：$NODE_NAME"
+  fi
   save_state child
   restart_netdata
   install_self
@@ -699,6 +722,9 @@ menu_deploy_child() {
   ask pip "父节点 Tailscale IP："
   ask_secret key "API Key（在父节点菜单里“显示加入命令”可看到，输入时不显示）："
   ask_secret ts "Tailscale auth key（可选，回车跳过）："
+  ask NODE_NAME "节点名称（可选，回车用主机名）："
+  NODE_NAME="$(echo "$NODE_NAME" | tr -d '[:space:]')"
+  if [ -n "$NODE_NAME" ]; then valid_name "$NODE_NAME" || die "名称只能用字母、数字、点、下划线、横线"; fi
   pip="$(echo "$pip" | tr -d '[:space:]')"
   key="$(echo "$key" | tr -d '[:space:]')"
   ts="$(echo "$ts" | tr -d '[:space:]')"
@@ -719,7 +745,7 @@ menu_update_self() {
 
 menu() {
   { : </dev/tty; } 2>/dev/null || usage   # 没有终端（比如在脚本里调用）时只打印用法
-  local role choice
+  local role choice jname
   while true; do
     role="$(state_get ROLE)"
     menu_header "$role"
@@ -742,7 +768,8 @@ menu() {
 EOF
         ask choice "请选择："
         case "$choice" in
-          1) run_action print_join_cmd ;;
+          1) ask jname "节点名称（可选，直接回车用对方的主机名）："
+             run_action print_join_cmd "$(echo "$jname" | tr -d '[:space:]')" ;;
           2) run_action cmd_status ;;
           3) run_action cmd_logs ;;
           4) run_action cmd_set_ts_key ;;
@@ -807,7 +834,7 @@ main() {
   case "$cmd" in
     parent)    need_root; cmd_parent "$@" ;;
     child)     need_root; cmd_child "$@" ;;
-    join-cmd)  need_root; print_join_cmd ;;
+    join-cmd)  need_root; print_join_cmd "$@" ;;
     rotate-key) need_root; cmd_rotate_key "$@" ;;
     set-ts-key) need_root; cmd_set_ts_key "$@" ;;
     clear-ts-key) need_root; cmd_clear_ts_key ;;
