@@ -19,6 +19,7 @@
 #      sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key，加入命令自动带上
 #      sudo netdata-manager clear-ts-key # 父节点：删除已保存的 Tailscale auth key
 #      sudo netdata-manager disable-cloud # 断开并禁用 Netdata Cloud（新部署默认已执行）
+#      sudo netdata-manager rename 新名字  # 修改本机在面板里显示的节点名称
 #      sudo netdata-manager status      # 查看状态 / 已连接的子节点
 #      sudo netdata-manager restart     # 重启 Netdata
 #      sudo netdata-manager logs        # 查看最近的推送(streaming)日志
@@ -41,7 +42,7 @@
 # =============================================================================
 set -euo pipefail
 
-SCRIPT_VERSION="2026.11.27-6"
+SCRIPT_VERSION="2026.11.27-7"
 STATE_FILE="/etc/netdata-manager.conf"
 REPO="nekoangel233/netdata-manager"
 SCRIPT_URL="https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/netdata-manager.sh"
@@ -276,9 +277,12 @@ cmd_parent() {
     log "沿用已有的 API Key"
   fi
 
+  local keep_name
+  keep_name="$(custom_name)"
   backup "$NETDATA_ETC/netdata.conf"
   cat > "$NETDATA_ETC/netdata.conf" <<EOF
 # 由 netdata-manager.sh 生成（角色：父节点）
+$(global_section "$keep_name")
 [db]
     mode = dbengine
     dbengine tier 0 retention size = $RETENTION
@@ -418,6 +422,48 @@ cmd_disable_cloud() {
   warn "Netdata Cloud 网站上仍保留着之前的节点记录：登录 app.netdata.cloud 把节点删掉，不再使用的话可以删除账号"
 }
 
+# ---- 节点名称 ----------------------------------------------------------------
+# 读取 netdata.conf 里自定义的节点名（没设置则为空）
+custom_name() {
+  local conf="$NETDATA_ETC/netdata.conf"
+  [ -f "$conf" ] || return 0
+  grep -m1 -E '^[[:space:]]*hostname[[:space:]]*=' "$conf" \
+    | sed -E 's/^[[:space:]]*hostname[[:space:]]*=[[:space:]]*//; s/[[:space:]]*$//' || true
+}
+
+# 生成配置时带上自定义节点名，避免重新部署后名字被冲掉
+global_section() {
+  local name="$1"
+  [ -n "$name" ] || return 0
+  printf '[global]\n    hostname = %s\n\n' "$name"
+}
+
+cmd_rename() {
+  netdata_installed || die "本机没有安装 Netdata"
+  detect_paths
+  local conf="$NETDATA_ETC/netdata.conf" cur name="${1:-}"
+  cur="$(custom_name)"
+  echo "当前节点名称：${cur:-$(hostname)}$([ -z "$cur" ] && echo '（系统主机名）')"
+  if [ -z "$name" ]; then
+    read -r -p "新的节点名称（字母、数字、. _ -；直接回车取消）：" name </dev/tty || true
+  fi
+  [ -n "$name" ] || { info "已取消"; return 0; }
+  [[ "$name" =~ ^[A-Za-z0-9._-]{1,63}$ ]] || die "名称只能用字母、数字、点、下划线、横线，最长 63 个字符"
+
+  backup "$conf"
+  sed -i -E '/^[[:space:]]*hostname[[:space:]]*=/d' "$conf"
+  if grep -q '^\[global\]' "$conf"; then
+    sed -i "0,/^\[global\]/s//[global]\n    hostname = $name/" "$conf"
+  else
+    { global_section "$name"; cat "$conf"; } > "$conf.tmp" && cat "$conf.tmp" > "$conf" && rm -f "$conf.tmp"
+  fi
+  restart_netdata
+  log "节点名称已改为：$name"
+  if [ "$(state_get ROLE)" = child ]; then
+    info "父节点面板里可能会暂时同时显示旧名字（离线）和新名字，旧的过一段时间会消失"
+  fi
+}
+
 # ---- 子节点 ------------------------------------------------------------------
 cmd_child() {
   parse_opts "$@"
@@ -457,9 +503,12 @@ check_parent_reachable() {
 }
 
 write_child_config() {
+  local keep_name
+  keep_name="$(custom_name)"
   backup "$NETDATA_ETC/netdata.conf"
   cat > "$NETDATA_ETC/netdata.conf" <<EOF
 # 由 netdata-manager.sh 生成（角色：子节点）
+$(global_section "$keep_name")
 [db]
     # 数据都存在父节点，本机只在内存里保留少量数据
     mode = ram
@@ -494,7 +543,7 @@ EOF
   install_self
 
   echo
-  log "子节点部署完成！约 1 分钟内应该能在父节点面板的 Nodes 列表里看到 $(hostname)"
+  log "子节点部署完成！约 1 分钟内应该能在父节点面板的 Nodes 列表里看到 ${keep_name:-$(hostname)}"
   info "如果没出现，执行：sudo $SELF logs"
 }
 
@@ -688,6 +737,7 @@ menu() {
   9) 重新部署父节点
  10) 卸载 Netdata
  11) 断开并禁用 Netdata Cloud
+ 12) 修改节点名称
   0) 退出
 EOF
         ask choice "请选择："
@@ -703,6 +753,7 @@ EOF
           9) run_action menu_deploy_parent ;;
           10) run_action cmd_uninstall ;;
           11) run_action cmd_disable_cloud ;;
+          12) run_action cmd_rename ;;
           0|q) exit 0 ;;
           *) warn "无效选项" ;;
         esac ;;
@@ -715,6 +766,7 @@ EOF
   5) 更新脚本
   6) 卸载 Netdata
   7) 断开并禁用 Netdata Cloud
+  8) 修改节点名称
   0) 退出
 EOF
         ask choice "请选择："
@@ -726,6 +778,7 @@ EOF
           5) menu_update_self ;;
           6) run_action cmd_uninstall ;;
           7) run_action cmd_disable_cloud ;;
+          8) run_action cmd_rename ;;
           0|q) exit 0 ;;
           *) warn "无效选项" ;;
         esac ;;
@@ -759,6 +812,7 @@ main() {
     set-ts-key) need_root; cmd_set_ts_key "$@" ;;
     clear-ts-key) need_root; cmd_clear_ts_key ;;
     disable-cloud) need_root; cmd_disable_cloud ;;
+    rename)    need_root; cmd_rename "$@" ;;
     menu|"")   need_root; menu ;;
     status)    need_root; cmd_status ;;
     restart)   need_root; restart_netdata ;;

@@ -90,6 +90,7 @@ sudo netdata-manager rotate-key  # 父节点：更换 API Key
 sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key
 sudo netdata-manager clear-ts-key # 父节点：删除保存的 Tailscale auth key
 sudo netdata-manager disable-cloud # 断开并禁用 Netdata Cloud
+sudo netdata-manager rename 新名字  # 修改节点在面板里显示的名称
 sudo netdata-manager logs        # 推送(streaming)相关日志
 sudo netdata-manager restart     # 重启 Netdata
 sudo netdata-manager update      # 更新本脚本
