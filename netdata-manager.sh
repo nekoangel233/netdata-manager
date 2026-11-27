@@ -12,9 +12,12 @@
 #      curl -fsSL https://raw.githubusercontent.com/nekoangel233/netdata-manager/main/netdata-manager.sh | sudo bash -s -- child --parent 100.x.x.x --key <API_KEY>
 #      （这条命令可以在父节点上执行 join-cmd 直接生成）
 #
-#    部署完成后，本脚本会安装为 netdata-manager 命令：
+#    部署完成后，本脚本会安装为 netdata-manager 命令。
+#    直接运行 sudo netdata-manager（不带参数）会打开交互式菜单。也可以用子命令：
 #      sudo netdata-manager join-cmd    # 父节点：打印子节点加入命令
 #      sudo netdata-manager rotate-key  # 父节点：更换 API Key（旧 Key 立即作废）
+#      sudo netdata-manager set-ts-key  # 父节点：保存 Tailscale auth key，加入命令自动带上
+#      sudo netdata-manager clear-ts-key # 父节点：删除已保存的 Tailscale auth key
 #      sudo netdata-manager status      # 查看状态 / 已连接的子节点
 #      sudo netdata-manager restart     # 重启 Netdata
 #      sudo netdata-manager logs        # 查看最近的推送(streaming)日志
@@ -103,7 +106,8 @@ parse_opts() {
       --interval)     INTERVAL="${2:?--interval 需要秒数}"; shift ;;
       --parent)       PARENT_IP="${2:?--parent 需要父节点 IP}"; shift ;;
       --key)          API_KEY="${2:?--key 需要 API Key}"; shift ;;
-      --ts-authkey)   TS_AUTHKEY="${2:?--ts-authkey 需要密钥}"; shift ;;
+      --ts-authkey)   TS_AUTHKEY="${2:?--ts-authkey 需要密钥}"; shift
+                      valid_ts_key "$TS_AUTHKEY" || die "--ts-authkey 格式不对，应以 tskey- 开头" ;;
       --full)         FULL=1 ;;
       -h|--help)      usage ;;
       *) die "未知参数：$1（用 --help 查看用法）" ;;
@@ -116,13 +120,28 @@ parse_opts() {
 # ---- 状态文件 ----------------------------------------------------------------
 load_state() { [ -f "$STATE_FILE" ] && . "$STATE_FILE" || true; }
 save_state() {
-  umask 077
-  cat > "$STATE_FILE" <<EOF
-ROLE="$1"
+  local role="$1" ts=""
+  # Tailscale auth key 只保存在父节点上，子节点不留
+  [ "$role" = parent ] && ts="$TS_AUTHKEY"
+  (
+    umask 077
+    cat > "$STATE_FILE" <<EOF
+ROLE="$role"
 API_KEY="$API_KEY"
 PARENT_IP="$PARENT_IP"
 BIND_IP="$BIND_IP"
+TS_AUTHKEY="$ts"
 EOF
+  )
+  chmod 600 "$STATE_FILE"
+}
+
+valid_ts_key() { [[ "$1" =~ ^tskey-[A-Za-z0-9_-]+$ ]]; }
+
+# 打码显示密钥：只露出开头和结尾
+mask() {
+  local k="$1"
+  if [ ${#k} -le 16 ]; then echo "****"; else echo "${k:0:10}****${k: -4}"; fi
 }
 
 # ---- Netdata 安装与路径 ------------------------------------------------------
@@ -289,9 +308,15 @@ print_join_cmd() {
   [ "${ROLE:-}" = parent ] || die "这台机器还不是父节点，请先部署父节点"
   echo "${c_cyan}在新服务器上执行这一条命令即可加入：${c_off}"
   echo
-  echo "  curl -fsSL $SCRIPT_URL | sudo bash -s -- child --parent $BIND_IP --key $API_KEY"
+  local extra=""
+  [ -n "${TS_AUTHKEY:-}" ] && extra=" --ts-authkey $TS_AUTHKEY"
+  echo "  curl -fsSL $SCRIPT_URL | sudo bash -s -- child --parent $BIND_IP --key $API_KEY$extra"
   echo
-  info "可在末尾加 --ts-authkey tskey-auth-xxx 免去手动登录 Tailscale"
+  if [ -n "${TS_AUTHKEY:-}" ]; then
+    info "已自动带上保存的 Tailscale auth key，新服务器不用再手动登录 Tailscale"
+  else
+    info "执行 sudo $SELF set-ts-key 保存 Tailscale auth key，以后加入命令会自动带上"
+  fi
   warn "API Key 相当于密码，不要公开发出去"
 }
 
@@ -432,6 +457,11 @@ cmd_status() {
   ss -tlnp 2>/dev/null | grep ':19999' | sed 's/^/  /' || echo "  （无，子节点不监听端口属于正常）"
 
   if [ "${ROLE:-}" = parent ]; then
+    if [ -n "${TS_AUTHKEY:-}" ]; then
+      echo "已保存的 Tailscale auth key：$(mask "$TS_AUTHKEY")"
+    else
+      echo "已保存的 Tailscale auth key：无"
+    fi
     echo
     echo "已连接的节点（含本机）："
     local info_json
@@ -465,6 +495,184 @@ cmd_uninstall() {
   log "Netdata 已卸载（Tailscale 未动，如需卸载请用系统包管理器）"
 }
 
+# ---- Tailscale auth key 管理（父节点）----------------------------------------
+cmd_set_ts_key() {
+  load_state
+  [ "${ROLE:-}" = parent ] || die "Tailscale auth key 只能保存在父节点上"
+  local key="${1:-}"
+  if [ -z "$key" ]; then
+    echo "在 Tailscale 后台 Settings → Keys → Generate auth key 生成，建议勾选 Reusable。"
+    read -r -s -p "粘贴 Tailscale auth key（输入时不显示）：" key </dev/tty || true
+    echo
+  fi
+  key="$(echo "$key" | tr -d '[:space:]')"
+  valid_ts_key "$key" || die "格式不对，应以 tskey- 开头"
+  TS_AUTHKEY="$key"
+  save_state parent
+  log "已保存到 $STATE_FILE（仅 root 可读）：$(mask "$key")"
+  info "以后 join-cmd 打印的加入命令会自动带上它"
+  warn "Tailscale auth key 有有效期（最长 90 天），过期后在后台重新生成，再执行一次这个操作"
+}
+
+cmd_clear_ts_key() {
+  load_state
+  [ "${ROLE:-}" = parent ] || die "只能在父节点上操作"
+  TS_AUTHKEY=""
+  save_state parent
+  log "已删除保存的 Tailscale auth key"
+}
+
+# ---- 交互式菜单 --------------------------------------------------------------
+# 每个操作放在子 shell 里执行：出错只退出这一项操作，不会退出菜单
+run_action() {
+  set +e
+  ( set -e; "$@" )
+  set -e
+}
+
+ask() {        # ask 变量名 提示语
+  local __v=""
+  read -r -p "$2" __v </dev/tty || true
+  printf -v "$1" '%s' "$__v"
+}
+
+ask_secret() { # 输入不回显
+  local __v=""
+  read -r -s -p "$2" __v </dev/tty || true
+  echo
+  printf -v "$1" '%s' "$__v"
+}
+
+pause() { local _p; read -r -p "按回车返回菜单..." _p </dev/tty || true; }
+
+state_get() {  # 读取状态文件里的某个字段，不影响当前变量
+  [ -f "$STATE_FILE" ] || return 0
+  ( . "$STATE_FILE"; eval "echo \"\${$1:-}\"" )
+}
+
+menu_header() {
+  local role="$1" svc ts
+  svc="$(systemctl is-active netdata 2>/dev/null || echo 未安装)"
+  echo
+  echo "${c_cyan}========== Netdata 管理菜单 ==========${c_off}"
+  case "$role" in
+    parent) echo "角色：父节点    Netdata：$svc" ;;
+    child)  echo "角色：子节点    Netdata：$svc    父节点：$(state_get PARENT_IP)" ;;
+    *)      echo "角色：未部署" ;;
+  esac
+  if [ "$role" = parent ]; then
+    ts="$(state_get TS_AUTHKEY)"
+    echo "Tailscale auth key：$([ -n "$ts" ] && mask "$ts" || echo 未保存)"
+  fi
+  echo "${c_cyan}======================================${c_off}"
+}
+
+menu_deploy_parent() {
+  local ts
+  echo "将把本机部署为父节点（已有的 API Key 会沿用）。"
+  ask_secret ts "Tailscale auth key（可选，回车跳过；填了会一并保存）："
+  ts="$(echo "$ts" | tr -d '[:space:]')"
+  if [ -n "$ts" ]; then cmd_parent --ts-authkey "$ts"; else cmd_parent; fi
+}
+
+menu_deploy_child() {
+  local pip key ts
+  ask pip "父节点 Tailscale IP："
+  ask_secret key "API Key（在父节点菜单里“显示加入命令”可看到，输入时不显示）："
+  ask_secret ts "Tailscale auth key（可选，回车跳过）："
+  pip="$(echo "$pip" | tr -d '[:space:]')"
+  key="$(echo "$key" | tr -d '[:space:]')"
+  ts="$(echo "$ts" | tr -d '[:space:]')"
+  if [ -n "$ts" ]; then
+    cmd_child --parent "$pip" --key "$key" --ts-authkey "$ts"
+  else
+    cmd_child --parent "$pip" --key "$key"
+  fi
+}
+
+menu_update_self() {
+  install_self
+  if [ -x "$INSTALL_PATH" ]; then
+    info "正在重新打开新版菜单..."
+    exec "$INSTALL_PATH" menu
+  fi
+}
+
+menu() {
+  { : </dev/tty; } 2>/dev/null || usage   # 没有终端（比如在脚本里调用）时只打印用法
+  local role choice
+  while true; do
+    role="$(state_get ROLE)"
+    menu_header "$role"
+    case "$role" in
+      parent)
+        cat <<'EOF'
+  1) 显示子节点加入命令
+  2) 查看状态 / 已连接的节点
+  3) 查看推送日志
+  4) 保存 / 更换 Tailscale auth key
+  5) 删除已保存的 Tailscale auth key
+  6) 更换 API Key（所有子节点需要重新加入）
+  7) 重启 Netdata
+  8) 更新脚本
+  9) 重新部署父节点
+ 10) 卸载 Netdata
+  0) 退出
+EOF
+        ask choice "请选择："
+        case "$choice" in
+          1) run_action print_join_cmd ;;
+          2) run_action cmd_status ;;
+          3) run_action cmd_logs ;;
+          4) run_action cmd_set_ts_key ;;
+          5) run_action cmd_clear_ts_key ;;
+          6) run_action cmd_rotate_key ;;
+          7) run_action restart_netdata ;;
+          8) menu_update_self ;;
+          9) run_action menu_deploy_parent ;;
+          10) run_action cmd_uninstall ;;
+          0|q) exit 0 ;;
+          *) warn "无效选项" ;;
+        esac ;;
+      child)
+        cat <<'EOF'
+  1) 查看状态
+  2) 查看推送日志
+  3) 更换父节点地址 / API Key
+  4) 重启 Netdata
+  5) 更新脚本
+  6) 卸载 Netdata
+  0) 退出
+EOF
+        ask choice "请选择："
+        case "$choice" in
+          1) run_action cmd_status ;;
+          2) run_action cmd_logs ;;
+          3) run_action menu_deploy_child ;;
+          4) run_action restart_netdata ;;
+          5) menu_update_self ;;
+          6) run_action cmd_uninstall ;;
+          0|q) exit 0 ;;
+          *) warn "无效选项" ;;
+        esac ;;
+      *)
+        cat <<'EOF'
+  1) 部署为父节点（用来查看所有服务器）
+  2) 部署为子节点（把数据推送给父节点）
+  0) 退出
+EOF
+        ask choice "请选择："
+        case "$choice" in
+          1) run_action menu_deploy_parent ;;
+          2) run_action menu_deploy_child ;;
+          0|q) exit 0 ;;
+          *) warn "无效选项" ;;
+        esac ;;
+    esac
+    pause
+  done
+}
+
 # ---- 入口 --------------------------------------------------------------------
 main() {
   local cmd="${1:-}"
@@ -474,12 +682,15 @@ main() {
     child)     need_root; cmd_child "$@" ;;
     join-cmd)  need_root; print_join_cmd ;;
     rotate-key) need_root; cmd_rotate_key "$@" ;;
+    set-ts-key) need_root; cmd_set_ts_key "$@" ;;
+    clear-ts-key) need_root; cmd_clear_ts_key ;;
+    menu|"")   need_root; menu ;;
     status)    need_root; cmd_status ;;
     restart)   need_root; restart_netdata ;;
     logs)      need_root; cmd_logs ;;
     update)    need_root; install_self ;;
     uninstall) need_root; cmd_uninstall ;;
-    ""|-h|--help|help) usage ;;
+    -h|--help|help) usage ;;
     *) die "未知命令：$cmd（用 --help 查看用法）" ;;
   esac
 }
